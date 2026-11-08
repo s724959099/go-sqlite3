@@ -21,6 +21,7 @@ type vfsShm struct {
 	readOnly bool
 	fileLock bool
 	blocking bool
+	strictRO bool
 }
 
 var _ blockingSharedMemory = &vfsShm{}
@@ -30,12 +31,20 @@ func (s *vfsShm) shmOpen() error {
 		return nil
 	}
 	if s.File == nil {
-		f, err := os.OpenFile(s.path,
-			os.O_RDWR|os.O_CREATE|_O_NOFOLLOW, 0666)
-		if err != nil {
-			f, err = os.OpenFile(s.path,
-				os.O_RDONLY|os.O_CREATE|_O_NOFOLLOW, 0666)
+		var f *os.File
+		var err error
+		if s.strictRO {
+			// Strict read-only: never create or write the -shm file.
+			f, err = os.OpenFile(s.path, os.O_RDONLY|_O_NOFOLLOW, 0)
 			s.readOnly = true
+		} else {
+			f, err = os.OpenFile(s.path,
+				os.O_RDWR|os.O_CREATE|_O_NOFOLLOW, 0666)
+			if err != nil {
+				f, err = os.OpenFile(s.path,
+					os.O_RDONLY|os.O_CREATE|_O_NOFOLLOW, 0666)
+				s.readOnly = true
+			}
 		}
 		if err != nil {
 			return sysError{err, _CANTOPEN}
@@ -138,6 +147,12 @@ func (s *vfsShm) shmLock(offset, n int32, flags _ShmFlag) error {
 		return _IOERR_SHMLOCK
 	}
 
+	// Strict read-only: an exclusive SHM lock needs a writable descriptor.
+	// Refuse it before any fcntl(F_WRLCK) is issued on the O_RDONLY fd.
+	if s.strictRO && flags&_SHM_EXCLUSIVE != 0 && flags&_SHM_UNLOCK == 0 {
+		return _IOERR_SHMLOCK
+	}
+
 	var timeout time.Duration
 	if s.blocking {
 		timeout = time.Millisecond
@@ -167,7 +182,7 @@ func (s *vfsShm) shmUnmap(delete bool) {
 	s.regions = nil
 
 	// Close the file.
-	if delete {
+	if delete && !s.strictRO {
 		os.Remove(s.path)
 	}
 	s.Close()
